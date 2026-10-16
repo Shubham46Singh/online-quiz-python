@@ -1,0 +1,170 @@
+
+version: 2.1
+
+jobs:
+  test-and-build-qa:
+    docker:
+      - image: cimg/python:3.12
+        environment:
+          DATABASE_URL: postgresql://quizuser:quizpass@localhost:5432/quizdb
+          REDIS_URL: redis://localhost:6379/0
+
+      - image: cimg/postgres:16.0
+        environment:
+          POSTGRES_DB: quizdb
+          POSTGRES_USER: quizuser
+          POSTGRES_PASSWORD: quizpass
+
+      - image: cimg/redis:7.0
+
+    steps:
+      - checkout
+
+      - run:
+          name: Install system dependencies
+          command: |
+            sudo apt-get update
+            sudo apt-get install -y postgresql-client
+
+      - run:
+          name: Install Python dependencies
+          command: |
+            python -m pip install --upgrade pip
+            pip install -r requirements.txt
+            pip install ruff pytest
+
+      - run:
+          name: Wait for PostgreSQL
+          command: |
+            for i in $(seq 1 30); do
+              pg_isready -h localhost -p 5432 \
+                -U quizuser -d quizdb && exit 0
+              sleep 2
+            done
+            echo "PostgreSQL did not become ready"
+            exit 1
+
+      - run:
+          name: Wait for Redis
+          command: |
+            for i in $(seq 1 30); do
+              if python -c "import redis; redis.Redis(host='localhost', port=6379).ping()"; then
+                exit 0
+              fi
+              sleep 2
+            done
+            echo "Redis did not become ready"
+            exit 1
+
+      - run:
+          name: Apply database migrations
+          command: |
+            for f in migrations/*.sql; do
+              PGPASSWORD=quizpass psql \
+                -h localhost -U quizuser -d quizdb \
+                -v ON_ERROR_STOP=1 -f "$f"
+            done
+
+      - run:
+          name: Secret scanning with Gitleaks
+          command: |
+            docker run --rm \
+              -v "$PWD:/repo" \
+              zricethezav/gitleaks:latest \
+              detect --source=/repo --no-git --redact
+
+      - run:
+          name: Lint
+          command: |
+            ruff check app
+
+      - run:
+          name: Run unit tests
+          command: PYTHONPATH=. pytest -v tests/test_unit.py
+
+      - run:
+          name: Run integration tests
+          command: PYTHONPATH=. pytest -v tests/test_integration.py
+
+      - setup_remote_docker
+
+      - run:
+          name: Build and push QA image
+          command: |
+            IMAGE="${DOCKERHUB_USER}/online-quiz-python"
+            SHORT_SHA="${CIRCLE_SHA1:0:7}"
+
+            echo "$DOCKERHUB_TOKEN" | docker login \
+              -u "$DOCKERHUB_USER" --password-stdin
+
+            docker build -t "${IMAGE}:qa" \
+              -t "${IMAGE}:main-${SHORT_SHA}" .
+
+            docker push "${IMAGE}:qa"
+            docker push "${IMAGE}:main-${SHORT_SHA}"
+
+  build-and-push-stage:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run:
+          name: Build and push staging image
+          command: |
+            IMAGE="${DOCKERHUB_USER}/online-quiz-python"
+            SHORT_SHA="${CIRCLE_SHA1:0:7}"
+
+            echo "$DOCKERHUB_TOKEN" | docker login \
+              -u "$DOCKERHUB_USER" --password-stdin
+
+            docker build -t "${IMAGE}:stage" \
+              -t "${IMAGE}:staging-${SHORT_SHA}" .
+
+            docker push "${IMAGE}:stage"
+            docker push "${IMAGE}:staging-${SHORT_SHA}"
+
+  build-and-push-prod:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run:
+          name: Build and push production image
+          command: |
+            IMAGE="${DOCKERHUB_USER}/online-quiz-python"
+            SHORT_SHA="${CIRCLE_SHA1:0:7}"
+
+            echo "$DOCKERHUB_TOKEN" | docker login \
+              -u "$DOCKERHUB_USER" --password-stdin
+
+            docker build -t "${IMAGE}:prod" \
+              -t "${IMAGE}:prod-${SHORT_SHA}" .
+
+            docker push "${IMAGE}:prod"
+            docker push "${IMAGE}:prod-${SHORT_SHA}"
+
+workflows:
+  version: 2
+
+  qa-pipeline:
+    jobs:
+      - test-and-build-qa:
+          filters:
+            branches:
+              only: main
+
+  staging-pipeline:
+    jobs:
+      - build-and-push-stage:
+          filters:
+            branches:
+              only: staging
+
+  production-pipeline:
+    jobs:
+      - build-and-push-prod:
+          filters:
+            branches:
+              only: prod

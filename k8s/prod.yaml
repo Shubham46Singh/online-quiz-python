@@ -1,0 +1,187 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: prod
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: prod
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: quizuser
+            - name: POSTGRES_PASSWORD
+              value: quizpass
+            - name: POSTGRES_DB
+              value: quizdb
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - pg_isready -U quizuser -d quizdb
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: postgres-data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: prod
+spec:
+  selector:
+    app: redis
+  ports:
+    - port: 6379
+      targetPort: 6379
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: prod
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          ports:
+            - containerPort: 6379
+          readinessProbe:
+            exec:
+              command:
+                - redis-cli
+                - ping
+            initialDelaySeconds: 3
+            periodSeconds: 5
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: quiz-migrations
+  namespace: prod
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: migrate
+          image: postgres:16-alpine
+          command:
+            - /bin/sh
+            - -c
+          args:
+            - |
+              until pg_isready -h postgres -U quizuser -d quizdb; do sleep 2; done
+              export PGPASSWORD=quizpass
+              psql -v ON_ERROR_STOP=1 -h postgres -U quizuser -d quizdb -f /migrations/001_schema.sql
+              psql -v ON_ERROR_STOP=1 -h postgres -U quizuser -d quizdb -f /migrations/002_seed.sql
+          volumeMounts:
+            - name: migrations
+              mountPath: /migrations
+      volumes:
+        - name: migrations
+          configMap:
+            name: quiz-migrations
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: online-quiz
+  namespace: prod
+spec:
+  selector:
+    app: online-quiz
+  ports:
+    - port: 8080
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: online-quiz
+  namespace: prod
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: online-quiz
+  template:
+    metadata:
+      labels:
+        app: online-quiz
+    spec:
+      imagePullSecrets:
+        - name: dockerhub
+      initContainers:
+        - name: wait-for-migrations
+          image: postgres:16-alpine
+          command:
+            - /bin/sh
+            - -c
+          args:
+            - |
+              until pg_isready -h postgres -U quizuser -d quizdb; do sleep 2; done
+              until PGPASSWORD=quizpass psql -h postgres -U quizuser -d quizdb -tAc "SELECT to_regclass('public.attempts')" | grep -q attempts; do sleep 2; done
+      containers:
+        - name: online-quiz
+          image: pprraannaavv/online-quiz-python:prod
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          env:
+            - name: DATABASE_URL
+              value: postgresql://quizuser:quizpass@postgres:5432/quizdb
+            - name: REDIS_URL
+              value: redis://redis:6379/0
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5

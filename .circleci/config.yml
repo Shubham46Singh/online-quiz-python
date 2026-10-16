@@ -1,0 +1,21 @@
+
+version: 2.1
+
+workflows:
+  quiz-platform:
+    jobs:
+      - validate-config
+
+jobs:
+  validate-config:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - checkout
+      - run:
+          name: Verify repository checkout
+          command: |
+            echo "CircleCI checkout succeeded."
+            test -f Dockerfile
+            test -f docker-compose.yml
+            test -f requirements.txt

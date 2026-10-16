@@ -1,0 +1,63 @@
+# Defines the containers/services that make up the Online Quiz Platform.
+services:
+
+  # PostgreSQL database: stores quizzes, questions, attempts, and scores.
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: quizuser
+      POSTGRES_PASSWORD: quizpass
+      POSTGRES_DB: quizdb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U quizuser -d quizdb"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  # Redis cache: stores temporary quiz-attempt data and answers.
+  cache:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+  # One-time service: applies SQL migration files before the web app starts.
+  migrate:
+    image: postgres:16-alpine
+    environment:
+      PGPASSWORD: quizpass
+    volumes:
+      - ./migrations:/migrations:ro
+    command: >
+      sh -c 'for f in /migrations/*.sql; do
+               echo "Applying $$f";
+               psql -h db -U quizuser -d quizdb -v ON_ERROR_STOP=1 -f "$$f" || exit 1;
+             done;
+             echo "Migrations completed"'
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # FastAPI application: builds from the Dockerfile in this project folder.
+  web:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: postgresql://quizuser:quizpass@db:5432/quizdb
+      REDIS_URL: redis://cache:6379/0
+    depends_on:
+      db:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+# Named volume keeps PostgreSQL data when the container is recreated.
+volumes:
+  postgres_data:
